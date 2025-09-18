@@ -1353,6 +1353,77 @@
     return results;
   }
 
+  function computeDomNodeSignature(node) {
+    if (!node || node.nodeType !== 1) {
+      return 'dom:unknown';
+    }
+
+    const segments = [];
+    let current = node;
+    let depth = 0;
+
+    while (current && current.nodeType === 1 && depth < 25) {
+      let segment = current.tagName ? current.tagName.toLowerCase() : 'element';
+
+      if (current.id && current.id.trim()) {
+        segment += `#${current.id.trim()}`;
+        segments.unshift(segment);
+        break;
+      }
+
+      const keyAttributePairs = [
+        ['data-message-id', current.getAttribute('data-message-id')],
+        ['data-msg-id', current.getAttribute('data-msg-id')],
+        ['data-item-id', current.getAttribute('data-item-id')],
+        ['data-test-id', current.getAttribute('data-test-id')],
+        ['data-testid', current.getAttribute('data-testid')],
+      ].filter(([, value]) => Boolean(value));
+      if (keyAttributePairs.length) {
+        segment += keyAttributePairs
+          .slice(0, 2)
+          .map(([name, value]) => `[${name}=${value}]`)
+          .join('');
+      } else {
+        const classList = typeof current.className === 'string'
+          ? current.className.trim().split(/\s+/).filter(Boolean)
+          : [];
+        if (classList.length) {
+          segment += `.${classList.slice(0, 3).join('.')}`;
+        }
+      }
+
+      let siblingIndex = 0;
+      let sibling = current.previousElementSibling;
+      while (sibling) {
+        if (sibling.tagName === current.tagName) {
+          siblingIndex += 1;
+        }
+        sibling = sibling.previousElementSibling;
+      }
+      segment += `:nth-of-type(${siblingIndex + 1})`;
+
+      segments.unshift(segment);
+
+      if (current.parentElement) {
+        current = current.parentElement;
+      } else {
+        break;
+      }
+
+      if (typeof document !== 'undefined') {
+        if (current === document.body || current === document.documentElement) {
+          const rootTag = current.tagName ? current.tagName.toLowerCase() : 'root';
+          segments.unshift(rootTag);
+          break;
+        }
+      }
+
+      depth += 1;
+    }
+
+    return `dom:${segments.join('>')}`;
+  }
+
   function normalizeDomMessage(node) {
     if (!node) {
       return null;
@@ -1367,6 +1438,10 @@
       node.id,
     ];
     let id = idCandidates.find(candidate => candidate && candidate.trim());
+
+    if (!id && dataset.julesExporterId) {
+      id = dataset.julesExporterId;
+    }
 
     const roleCandidates = [
       dataset.role,
@@ -1389,7 +1464,19 @@
     }
 
     if (!id) {
-      id = computeDeterministicId(role, [text], thoughts, null, { path: 'dom', index: state.timeline.length });
+      const signature = computeDomNodeSignature(node);
+      id = computeDeterministicId(role, [text], thoughts, null, { path: signature, index: 0 });
+      try {
+        node.dataset.julesExporterId = id;
+      } catch (err) {
+        log('Failed to store exporter id on DOM node', err);
+      }
+    } else if (!dataset.julesExporterId) {
+      try {
+        node.dataset.julesExporterId = id;
+      } catch (err) {
+        log('Failed to persist existing message id on DOM node', err);
+      }
     }
 
     return {
