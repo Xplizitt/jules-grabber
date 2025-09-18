@@ -15,6 +15,8 @@
 (function () {
   'use strict';
 
+  const PAGE = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+
   const CONFIG = {
     debug: false,
     includeRawPacketsInExport: true,
@@ -56,7 +58,16 @@
     maxMessages: 500,
   };
 
-  const STATUS_NOISE_PATTERN = /^(task (?:is in progress|is completed|encountered an error))( task (?:is in progress|is completed|encountered an error))*$/i;
+  const STATUS_PHRASES = [
+    'task is in progress',
+    'task is completed',
+    'task encountered an error',
+  ];
+  const STATUS_REGEX_PART = STATUS_PHRASES
+    .map(phrase => phrase.replace(/\s+/g, '\\s+'))
+    .join('|');
+  const STATUS_NOISE_PATTERN = new RegExp(`^(?:${STATUS_REGEX_PART})(?:\\s+(?:${STATUS_REGEX_PART}))*$`, 'i');
+  const STATUS_COLLAPSED = STATUS_PHRASES.map(phrase => phrase.replace(/[^a-z]+/gi, '').toLowerCase());
 
   const state = {
     packets: [],
@@ -88,6 +99,17 @@
 
   function error(...args) {
     console.error(LOGGER_PREFIX, ...args);
+  }
+
+  function now() {
+    try {
+      if (PAGE.performance && typeof PAGE.performance.now === 'function') {
+        return PAGE.performance.now();
+      }
+    } catch (err) {
+      log('Falling back to Date.now for timing', err);
+    }
+    return Date.now();
   }
 
   function init() {
@@ -161,13 +183,13 @@
   }
 
   function interceptFetch() {
-    if (!window.fetch) {
+    if (!PAGE.fetch) {
       warn('Fetch API not present; network capture will be limited.');
       return;
     }
-    const nativeFetch = window.fetch.bind(window);
-    window.fetch = async function(resource, init) {
-      const startTime = performance.now();
+    const nativeFetch = PAGE.fetch.bind(PAGE);
+    PAGE.fetch = async function(resource, init) {
+      const startTime = now();
       const response = await nativeFetch(resource, init);
       try {
         const clone = response.clone();
@@ -175,7 +197,7 @@
           if (bodyText) {
             handleNetworkPacket(resource, init, bodyText, {
               startTime,
-              endTime: performance.now(),
+              endTime: now(),
               status: response.status,
               from: 'fetch',
             });
@@ -188,21 +210,32 @@
       }
       return response;
     };
+    if (PAGE !== window) {
+      window.fetch = function(resource, init) {
+        return PAGE.fetch(resource, init);
+      };
+    }
   }
 
   function interceptXhr() {
-    const originalOpen = XMLHttpRequest.prototype.open;
-    const originalSend = XMLHttpRequest.prototype.send;
+    if (!PAGE.XMLHttpRequest) {
+      warn('XMLHttpRequest API not present; network capture will be limited.');
+      return;
+    }
 
-    XMLHttpRequest.prototype.open = function(method, url, async, user, password) {
+    const XHR = PAGE.XMLHttpRequest;
+    const originalOpen = XHR.prototype.open;
+    const originalSend = XHR.prototype.send;
+
+    XHR.prototype.open = function(method, url, async, user, password) {
       this.__julesExporter = this.__julesExporter || {};
       this.__julesExporter.method = method;
       this.__julesExporter.url = url;
-      this.__julesExporter.startTime = performance.now();
+      this.__julesExporter.startTime = now();
       return originalOpen.apply(this, arguments);
     };
 
-    XMLHttpRequest.prototype.send = function(body) {
+    XHR.prototype.send = function(body) {
       this.__julesExporter = this.__julesExporter || {};
       this.__julesExporter.requestBody = body;
       this.addEventListener('load', function() {
@@ -216,11 +249,14 @@
         }
         meta.status = this.status;
         meta.from = 'xhr';
-        meta.endTime = performance.now();
+        meta.endTime = now();
         handleNetworkPacket(meta.url, { method: meta.method, body }, responseText, meta);
       });
       return originalSend.apply(this, arguments);
     };
+    if (PAGE !== window) {
+      window.XMLHttpRequest = PAGE.XMLHttpRequest;
+    }
   }
 
   function getUrlFromResource(resource) {
@@ -865,6 +901,23 @@
     return result;
   }
 
+  function matchesCollapsedStatusNoise(collapsed) {
+    if (!collapsed) {
+      return false;
+    }
+    let remaining = collapsed;
+    let matched = false;
+    while (remaining.length) {
+      const match = STATUS_COLLAPSED.find(token => remaining.startsWith(token));
+      if (!match) {
+        return false;
+      }
+      matched = true;
+      remaining = remaining.slice(match.length);
+    }
+    return matched;
+  }
+
   function isKnownStatusNoise(text) {
     if (!text) {
       return false;
@@ -873,7 +926,16 @@
     if (!normalized) {
       return false;
     }
-    return STATUS_NOISE_PATTERN.test(normalized);
+    const lowered = normalized.toLowerCase();
+    if (STATUS_NOISE_PATTERN.test(lowered)) {
+      return true;
+    }
+    const spaced = lowered.replace(/task/g, ' task').replace(/\s+/g, ' ').trim();
+    if (spaced !== lowered && STATUS_NOISE_PATTERN.test(spaced)) {
+      return true;
+    }
+    const collapsed = lowered.replace(/[^a-z]+/g, '');
+    return matchesCollapsedStatusNoise(collapsed);
   }
 
   function upsertMessage(message) {
